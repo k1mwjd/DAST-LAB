@@ -1,0 +1,80 @@
+name: DAST scan
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+jobs:
+    zap-scan:
+        runs-on: ubuntu-latest     # 생성할 VM
+        timeout-minutes: 40        # worlflow의 작업이 40분을 넘어가면 강제 종료
+
+        services:
+            db:
+                image: mariadb:10  # VM이 사용할 image를 외부 db에서 받아옴
+                env:
+                    MYSQL_ROOT_PASSWORD: dvwa
+                    MYSQL_DATABASE: dvwa
+                    MYSQL_USER: dvwa
+                    MYSQL_USER_PASSwORD: p@ssw0rd
+                options: >-
+                    --helth-cmd "healthcheck.sh --connect --innodb_initialized"
+                    --health-interval 5s --health-timeout 5s --health-retries 30
+            dvwa:
+                image: ghcr.io/digininja/dvwa:latest
+                env:
+                    MYSQL_SERVER: db
+                ports:
+                    - 80:80
+        env:
+            TaRGET_URL: http://localhost
+            SECURITY_LEVEL: low
+            MAX_HIGH: 0
+        steps:
+            - name: Checkout
+              uses: actions/checkout@7
+
+            - name: Set up Python
+              uses: actions/setup-python@7
+              with:
+                  python-version: '3.12'
+
+            - name: Install Python packages
+              run: pip install zaproxy requests
+
+            - name: Generate a one-tine ZAP API key
+              echo "::add-mask::$KEY"
+              echo "ZAP_API_KEY=$KEY" >> "$GITHUB_ENV"
+            
+            -name: Start ZAP in daemon mode
+              run: |
+                  docker run -d --name zap --network host \
+                      ghcr.io/zaproxy/zaproxy:stable \
+                      zap.sh -daemon -host 127.0.0.1 -port 8080 \
+                      -config api.key="$ZAP_API_KEY"
+                  for i in $(seq 1 30); do
+                      curl -sf "http://127.0.0.1:8080/JSON/core/view/version/?apikey=$ZAP_API_KEY" && break
+                      sleep 5
+                  done
+
+            - name: Initialize DVWA database
+              run: python ci/setup_dvwa.py
+            
+
+            - name: Run ZAP scan and quality gate
+              run: python ci/run_zap_scan.py
+
+            - name: Run ZAP scan reports
+              if: always()
+              uses: actions/upload-artifact@7
+              with:
+                  name: zap-reports
+                  path: |
+                      zap_report.html
+                      zap_alert.json
+
+
+            - name: Show ZAP log on failure
+              if: failure()
+              run: docker logs zap | tail -n 50
