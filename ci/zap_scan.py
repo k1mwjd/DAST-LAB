@@ -8,7 +8,7 @@ import time
 import requests
 from zapv2 import ZAPv2
 
-TARGET = os.environ.get('TARGET', 'http://localhost').rstrip('/')
+TARGET = os.environ.get('TARGET', 'http://127.0.0.1').rstrip('/')
 LOGIN = f'{TARGET}/login.php'
 API_KEY = os.environ['ZAP_API_KEY']
 LEVEL = os.environ.get('SECURITY_LEVEL', 'low')
@@ -19,28 +19,39 @@ EXCLUDES = ['logout.php', 'setup.php', 'security.php', 'login.php', '/csrf/']
 
 
 def wait(get_status, label, interval=5):
-    while int(get_status()) < 100:
-        print(f'[*] {label}: {get_status()}%')
+    status = int(get_status())
+    while status < 100:
+        print(f'[*] {label}: {status}%')
         time.sleep(interval)
+        status = int(get_status())
     print(f'[*] {label}: completed')
 
 
 def dvwa_login():
     # DVWA login form requires an anti-CSRF token (user_token)
-    s = requests.Session()
-    page = s.get(LOGIN).text
-    token = re.search(r"name='user_token' value='([^']+)'", page).group(1)
-    r = s.post(LOGIN, data={'username': 'admin', 'password': 'password',
-                            'Login': 'Login', 'user_token': token})
-    if 'login.php' in r.url:
-        sys.exit('[!] Login failed')
-    return s.cookies.get('PHPSESSID')
+    with requests.Session() as session:
+        page = session.get(LOGIN, timeout=10)
+        page.raise_for_status()
+        token = re.search(r'''name=["']user_token["']\s+value=["']([^"']+)["']''', page.text)
+        if token is None:
+            sys.exit('[!] DVWA login token missing')
+
+        response = session.post(LOGIN, data={
+            'username': 'admin', 'password': 'password',
+            'Login': 'Login', 'user_token': token.group(1),
+        }, timeout=10)
+        response.raise_for_status()
+        session_id = session.cookies.get('PHPSESSID')
+        if response.url != f'{TARGET}/index.php' or not session_id:
+            sys.exit('[!] DVWA login failed')
+        return session_id
 
 
 def scan(zap):
     for page in EXCLUDES:
-        zap.spider.exclude_from_scan(f'.*{page}.*')
-        zap.ascan.exclude_from_scan(f'.*{page}.*')
+        pattern = f'.*{re.escape(page)}.*'
+        zap.spider.exclude_from_scan(pattern)
+        zap.ascan.exclude_from_scan(pattern)
 
     # Inject the logged-in session cookie into every ZAP request
     session_id = dvwa_login()
@@ -63,10 +74,10 @@ def scan(zap):
 
 
 def report(zap):
-    alerts = zap.core.alerts(baseurl=TARGET)
-    with open('zap-report.html', 'w') as f:
+    alerts = zap.alert.alerts(baseurl=TARGET)
+    with open('zap-report.html', 'w', encoding='utf-8') as f:
         f.write(zap.core.htmlreport())
-    with open('zap-alerts.json', 'w') as f:
+    with open('zap-alerts.json', 'w', encoding='utf-8') as f:
         json.dump(alerts, f, indent=2)
 
     # One row per alert type (the same type appears on many URLs)
@@ -89,14 +100,13 @@ def report(zap):
     # Shown on the workflow run page in GitHub Actions
     path = os.environ.get('GITHUB_STEP_SUMMARY')
     if path:
-        with open(path, 'a') as f:
+        with open(path, 'a', encoding='utf-8') as f:
             f.write(summary + '\n')
     return counts['High']
 
 
 def main():
-    zap = ZAPv2(apikey=API_KEY, proxies={'http': 'http://127.0.0.1:8080',
-                                            'https': 'http://127.0.0.1:8080'})
+    zap = ZAPv2(apikey=API_KEY, validate_status_code=True)
     print(f'[*] Connected to ZAP {zap.core.version}')
     scan(zap)
     high = report(zap)
